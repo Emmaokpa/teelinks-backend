@@ -11,7 +11,17 @@ const app = express();
 const port = process.env.PORT || 3001;
 
 // Middleware
-app.use(cors());
+// Configure CORS to allow requests only from your frontend domain
+const allowedOrigins = ['https://teelinks.infy.uk']; // Replace with your actual frontend URL
+// Add localhost for local development testing
+if (process.env.NODE_ENV !== 'production') {
+    allowedOrigins.push('http://localhost:5500'); // Adjust port if your local frontend uses a different one
+    allowedOrigins.push('http://127.0.0.1:5500'); // Sometimes 127.0.0.1 is needed too
+}
+app.use(cors({
+    origin: allowedOrigins
+}));
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -27,10 +37,9 @@ if (!ADMIN_SECRET) {
     console.error("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
     // process.exit(1); // Optionally exit if secret is crucial for startup
 }
-
 const authenticateAdmin = (req, res, next) => {
-    if (!ADMIN_SECRET) { // Fallback if .env is missing, though we logged an error
-        console.warn("Admin authentication is disabled because ADMIN_SECRET_KEY is not set.");
+    if (!ADMIN_SECRET) {
+        console.error("Admin authentication failed: ADMIN_SECRET_KEY is not set on the server. Access will be allowed without authentication (dev fallback).");
         return next(); // In a real scenario, you might want to deny access here.
     }
 
@@ -43,43 +52,33 @@ const authenticateAdmin = (req, res, next) => {
     }
 };
 
-// ... (rest of your Express app setup, Supabase client, Multer setup)
+
 
 
 // --- Supabase Client Setup ---
 const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_SERVICE_KEY;
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY; // Use SERVICE_ROLE_KEY for backend operations
 
 if (!supabaseUrl || !supabaseKey) {
     console.error("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
-    console.error("FATAL: SUPABASE_URL or SUPABASE_SERVICE_KEY is missing from .env");
+    console.error("FATAL: SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is missing from .env or environment variables.");
     console.error("Please ensure these are set correctly.");
     console.error("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
-    process.exit(1);
+    process.exit(1); // Exit if essential config is missing
 }
+
 const supabase = createClient(supabaseUrl, supabaseKey);
 console.log("Supabase client initialized.");
 
 // --- Multer Setup for File Uploads ---
-const uploadsDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadsDir)){
-    fs.mkdirSync(uploadsDir, { recursive: true });
-    console.log(`Created 'uploads' directory at: ${uploadsDir}`);
-}
-
-const multerStorage = multer.diskStorage({
-    destination: (req, file, cb) => {
-        cb(null, uploadsDir);
-    },
-    filename: (req, file, cb) => {
-        cb(null, Date.now() + '-' + file.originalname.replace(/\s+/g, '-')); // Sanitize filename
-    }
-});
+// Use memoryStorage to avoid writing to the ephemeral filesystem on Render
+const multerStorage = multer.memoryStorage();
 
 const upload = multer({
     storage: multerStorage,
     fileFilter: (req, file, cb) => {
         // Basic image file type filter
+        // Also check file size if needed
         if (file.mimetype.startsWith('image/')) {
             cb(null, true);
         } else {
@@ -97,26 +96,22 @@ app.post('/api/products', authenticateAdmin, upload.single('productImage'), asyn
         const imageFile = req.file;
 
         if (!name || !affiliateLink || !imageFile) {
-            if (imageFile && fs.existsSync(imageFile.path)) {
-                fs.unlinkSync(imageFile.path);
-            }
             return res.status(400).json({ message: 'Name, affiliate link, and product image are required.' });
         }
 
-        let imageFileId = null;
         let imageUrl = null;
-        // let imagePathInBucket = null; // We won't store this separately in the DB if only image_url is used
+        let imagePathInBucket = null; // Store this to use for deletion later
         const bucketName = 'product-images'; // Should match your Supabase bucket name
 
+        // Use file.buffer with memoryStorage
         try {
-            const fileContent = fs.readFileSync(imageFile.path);
             // Define a path within the bucket. Still useful for uploading, even if not stored in DB.
-            const imagePathInBucket = `public/${Date.now()}-${imageFile.filename}`; 
-            console.log(`Attempting to upload file: ${imageFile.filename} to Supabase bucket: ${bucketName} at path: ${imagePathInBucket}`);
+            const generatedPath = `public/${Date.now()}-${imageFile.originalname.replace(/\s+/g, '-')}`; 
+            console.log(`Attempting to upload file: ${imageFile.originalname} to Supabase bucket: ${bucketName} at path: ${generatedPath}`);
 
             const { data: uploadData, error: uploadError } = await supabase.storage
                 .from(bucketName)
-                .upload(imagePathInBucket, fileContent, {
+                .upload(generatedPath, imageFile.buffer, { // Use file.buffer here
                     contentType: imageFile.mimetype,
                     upsert: false // true to overwrite if file with same path exists
                 });
@@ -128,32 +123,25 @@ app.post('/api/products', authenticateAdmin, upload.single('productImage'), asyn
             console.log("Supabase Storage: File uploaded successfully. Path:", uploadData.path);
 
             // Get public URL
+            // Note: Supabase recommends using the path from uploadData.path for getPublicUrl
             const { data: publicUrlData } = supabase.storage
                 .from(bucketName)
-                .getPublicUrl(imagePathInBucket);
+                .getPublicUrl(uploadData.path); // Use path from uploadData
 
             if (!publicUrlData || !publicUrlData.publicUrl) {
                  throw new Error('Could not get public URL for the uploaded image.');
             }
             imageUrl = publicUrlData.publicUrl;
+            imagePathInBucket = uploadData.path; // Store the path returned by Supabase
             console.log("Supabase Storage: Image URL:", imageUrl);
 
         } catch (storageError) {
             console.error('Supabase Storage Error:', storageError);
-            if (imageFile && fs.existsSync(imageFile.path)) {
-                fs.unlinkSync(imageFile.path);
-            }
             let errorMessage = 'Failed to upload image to Supabase storage.';
             if (storageError && storageError.message) {
                 errorMessage += ` Details: ${storageError.message}`;
             }
             return res.status(500).json({ message: errorMessage, error: storageError.message || storageError });
-        } finally {
-            // Always clean up the local temporary file
-            if (imageFile && fs.existsSync(imageFile.path)) {
-                fs.unlinkSync(imageFile.path);
-                console.log(`Cleaned up local file: ${imageFile.path}`);
-            }
         }
 
         const productData = {
@@ -162,7 +150,7 @@ app.post('/api/products', authenticateAdmin, upload.single('productImage'), asyn
             affiliate_link: affiliateLink,
             price: price || null,
             image_url: imageUrl,
-            // image_path: imagePathInBucket // We decided not to store this
+            image_path_in_bucket: imagePathInBucket, // Store the path for easier deletion
             category: category || null, // Save category, default to null if empty
             is_top_pick: isTopPick === 'true' // Convert string "true" to boolean true, otherwise false
         };
@@ -185,10 +173,6 @@ app.post('/api/products', authenticateAdmin, upload.single('productImage'), asyn
 
     } catch (error) {
         console.error('Error adding product:', error);
-        // Ensure local file is cleaned up if any operation fails
-        if (req.file && fs.existsSync(req.file.path)) {
-            fs.unlinkSync(req.file.path);
-        }
         let errorMessage = 'Failed to add product.';
         if (error && error.message) {
             errorMessage += ` Details: ${error.message}`;
@@ -280,12 +264,6 @@ app.put('/api/products/:id', authenticateAdmin, upload.single('productImage'), a
 
     try {
         const updateData = {
-            // name, // Only include if name is provided and not empty
-            // description: description || null,
-            // affiliate_link: affiliateLink,
-            // price: price || null,
-            // category: category || null,
-            // is_top_pick: isTopPick === 'true',
         };
 
         // Conditionally add fields to updateData to avoid overwriting with undefined or empty strings
@@ -301,13 +279,12 @@ app.put('/api/products/:id', authenticateAdmin, upload.single('productImage'), a
         // If a new image is uploaded, handle it
         if (imageFile) {
             const bucketName = 'product-images';
-            const fileContent = fs.readFileSync(imageFile.path);
-            const imagePathInBucket = `public/${Date.now()}-${imageFile.filename.replace(/\s+/g, '-')}`;
+            const generatedPath = `public/${Date.now()}-${imageFile.originalname.replace(/\s+/g, '-')}`;
 
-            console.log(`Uploading new image to Supabase bucket: ${bucketName} at path: ${imagePathInBucket}`);
+            console.log(`Uploading new image to Supabase bucket: ${bucketName} at path: ${generatedPath}`);
             const { data: uploadData, error: uploadError } = await supabase.storage
                 .from(bucketName)
-                .upload(imagePathInBucket, fileContent, {
+                .upload(generatedPath, imageFile.buffer, { // Use file.buffer
                     contentType: imageFile.mimetype,
                     upsert: true // Use upsert true if you want to overwrite
                 });
@@ -316,28 +293,41 @@ app.put('/api/products/:id', authenticateAdmin, upload.single('productImage'), a
 
             const { data: publicUrlData } = supabase.storage
                 .from(bucketName)
-                .getPublicUrl(imagePathInBucket);
+                .getPublicUrl(uploadData.path); // Use path from uploadData
             
             if (!publicUrlData || !publicUrlData.publicUrl) {
                 throw new Error('Could not get public URL for the new uploaded image.');
             }
             updateData.image_url = publicUrlData.publicUrl;
-            
-            if (fs.existsSync(imageFile.path)) {
-                fs.unlinkSync(imageFile.path);
-                console.log(`Cleaned up local temp file for update: ${imageFile.path}`);
-            }
+            updateData.image_path_in_bucket = uploadData.path; // Store the new path
+
+            // TODO: Consider deleting the old image from storage if a new one is uploaded
+            // You would need to fetch the old image_path_in_bucket before the update
         } else {
             console.log("No new image provided for update.");
         }
         
         // Ensure there's something to update if no image and other fields might be empty
         if (Object.keys(updateData).length === 0) {
-            // If only an image was potentially changed but not provided,
-            // and no other fields are being updated, we might not need to hit the DB.
-            // However, the current logic will proceed if any field (even if empty string converting to null) is present.
-            // For a more robust update, you might check if updateData is truly empty.
-            console.log("No actual data fields to update (excluding potential image change if no new image was uploaded).");
+            // If no fields were provided in the body and no new image was uploaded,
+            // there's nothing to update in the database.
+            console.log("No update data provided.");
+            return res.status(400).json({ message: "No update data provided." });
+        }
+
+        // Conditionally add fields to updateData if they are provided in the request body
+        // This prevents overwriting existing data with undefined or null if the field wasn't sent.
+        if (req.body.name !== undefined) updateData.name = req.body.name;
+        if (req.body.description !== undefined) updateData.description = req.body.description || null;
+        if (req.body.affiliateLink !== undefined) updateData.affiliate_link = req.body.affiliateLink;
+        if (req.body.price !== undefined) updateData.price = req.body.price || null;
+        if (req.body.category !== undefined) updateData.category = req.body.category || null;
+        if (req.body.isTopPick !== undefined) updateData.is_top_pick = req.body.isTopPick === 'true';
+
+        // Ensure there's something to update if no image and other fields might be empty
+        if (Object.keys(updateData).length === 0) {
+            console.log("No update data provided.");
+            return res.status(400).json({ message: "No update data provided." });
         }
 
 
@@ -352,26 +342,17 @@ app.put('/api/products/:id', authenticateAdmin, upload.single('productImage'), a
         if (dbError) throw dbError;
 
         if (!dbData) {
-            // This can happen if the ID doesn't exist or if the updateData resulted in no actual change
-            // to the row according to Supabase (e.g., all values were the same).
-            // However, .select().single() should return the row if it exists, even if no fields changed.
-            // A 404 might be more appropriate if the ID truly doesn't exist.
-            console.warn(`Product with ID ${id} not found or no changes were made during update.`);
-            // Let's assume if dbData is null after an update attempt on an existing ID, the ID was wrong.
-            // If the ID is correct but no fields changed, Supabase update might return the existing row.
-            // If the ID is invalid, Supabase might return an error or null data.
-            // For now, if dbData is null, let's treat it as not found.
+            // If Supabase update with .eq('id', id) and .single() returns null data,
+            // it typically means no row matched the ID.
+            console.warn(`Product with ID ${id} not found for update.`);
             return res.status(404).json({ message: 'Product not found.' });
         }
 
         console.log("Supabase Database: Product updated successfully:", dbData);
         res.status(200).json({ message: 'Product updated successfully!', data: dbData });
-
     } catch (error) {
         console.error(`Error updating product ${id}:`, error);
-        if (imageFile && fs.existsSync(imageFile.path)) { 
-            fs.unlinkSync(imageFile.path);
-        }
+        // With memoryStorage, local file cleanup for imageFile is not needed here.
         res.status(500).json({ message: `Failed to update product. Details: ${error.message}`, error: error.message || error });
     }
 });
@@ -382,18 +363,20 @@ app.delete('/api/products/:id', authenticateAdmin, async (req, res) => {
     console.log(`Attempting to delete product ID: ${id}`);
 
     try {
-        // Optional: First, fetch the product to get its image_url for deletion from storage
+        // Fetch the product first to get its image_path_in_bucket for deletion from storage
         const { data: productToDelete, error: fetchError } = await supabase
             .from('products')
-            .select('image_url')
+            .select('image_path_in_bucket') // Select the stored path
             .eq('id', id)
             .single();
 
         if (fetchError || !productToDelete) {
             console.warn(`Product with ID ${id} not found for deletion or error fetching it.`, fetchError);
-            // If product not found, we might still proceed to attempt deletion from DB,
-            // or return 404 if fetchError indicates it doesn't exist.
-            // For now, let's proceed to delete from DB, Supabase handles non-existent deletes gracefully.
+             // If product not found, we can return 404 immediately
+             if (fetchError && fetchError.code === 'PGRST116') { // Supabase code for not found
+                 return res.status(404).json({ message: 'Product not found.' });
+             }
+            // Otherwise, log the error and proceed to attempt DB deletion just in case
         }
 
         // Delete the product from the database
@@ -408,25 +391,21 @@ app.delete('/api/products/:id', authenticateAdmin, async (req, res) => {
 
         console.log(`Product with ID ${id} deleted from database.`);
 
-        // If product had an image_url, attempt to delete it from storage
-        if (productToDelete && productToDelete.image_url) {
+        // If product had an image_path_in_bucket, attempt to delete it from storage
+        if (productToDelete && productToDelete.image_path_in_bucket) {
             const bucketName = 'product-images';
-            // Extract the path from the public URL.
-            // Example URL: https://<project-ref>.supabase.co/storage/v1/object/public/product-images/public/image.jpg
-            // The path within the bucket would be 'public/image.jpg'
-            const urlParts = productToDelete.image_url.split(`/storage/v1/object/public/${bucketName}/`);
-            if (urlParts.length > 1) {
-                const imagePathInBucket = urlParts[1];
-                console.log(`Attempting to delete image from storage: ${bucketName}/${imagePathInBucket}`);
-                const { error: storageDeleteError } = await supabase.storage
-                    .from(bucketName)
-                    .remove([imagePathInBucket]);
-                if (storageDeleteError) {
-                    console.warn(`Failed to delete image from storage (product DB record deleted successfully): ${storageDeleteError.message}`);
-                    // Don't fail the whole request if image deletion fails, but log it.
-                } else {
-                    console.log(`Image ${imagePathInBucket} deleted from storage.`);
-                }
+            const imagePathInBucket = productToDelete.image_path_in_bucket; // Use the stored path directly
+
+            console.log(`Attempting to delete image from storage: ${bucketName}/${imagePathInBucket}`);
+            const { error: storageDeleteError } = await supabase.storage
+                .from(bucketName)
+                .remove([imagePathInBucket]); // Pass the path in an array
+
+            if (storageDeleteError) {
+                console.warn(`Failed to delete image from storage (product DB record deleted successfully): ${storageDeleteError.message}`);
+                // Don't fail the whole request if image deletion fails, but log it.
+            } else {
+                console.log(`Image ${imagePathInBucket} deleted from storage.`);
             }
         }
 
@@ -438,6 +417,6 @@ app.delete('/api/products/:id', authenticateAdmin, async (req, res) => {
     }
 });
 
-app.listen(port, () => {
-    console.log(`Teelinks backend server running on http://localhost:${port}`);
+app.listen(port, '0.0.0.0', () => { // Listen on 0.0.0.0 for Render
+    console.log(`Teelinks backend server running on host 0.0.0.0 port ${port}`);
 });
