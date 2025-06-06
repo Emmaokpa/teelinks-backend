@@ -150,7 +150,6 @@ app.post('/api/products', authenticateAdmin, upload.single('productImage'), asyn
             affiliate_link: affiliateLink,
             price: price || null,
             image_url: imageUrl,
-            image_path_in_bucket: imagePathInBucket, // Store the path for easier deletion
             category: category || null, // Save category, default to null if empty
             is_top_pick: isTopPick === 'true' // Convert string "true" to boolean true, otherwise false
         };
@@ -299,7 +298,6 @@ app.put('/api/products/:id', authenticateAdmin, upload.single('productImage'), a
                 throw new Error('Could not get public URL for the new uploaded image.');
             }
             updateData.image_url = publicUrlData.publicUrl;
-            updateData.image_path_in_bucket = uploadData.path; // Store the new path
 
             // TODO: Consider deleting the old image from storage if a new one is uploaded
             // You would need to fetch the old image_path_in_bucket before the update
@@ -363,10 +361,10 @@ app.delete('/api/products/:id', authenticateAdmin, async (req, res) => {
     console.log(`Attempting to delete product ID: ${id}`);
 
     try {
-        // Fetch the product first to get its image_path_in_bucket for deletion from storage
+        // Fetch the product first to get its image_url for deriving the storage path
         const { data: productToDelete, error: fetchError } = await supabase
             .from('products')
-            .select('image_path_in_bucket') // Select the stored path
+            .select('image_url') // Select the image_url
             .eq('id', id)
             .single();
 
@@ -391,24 +389,33 @@ app.delete('/api/products/:id', authenticateAdmin, async (req, res) => {
 
         console.log(`Product with ID ${id} deleted from database.`);
 
-        // If product had an image_path_in_bucket, attempt to delete it from storage
-        if (productToDelete && productToDelete.image_path_in_bucket) {
+        // If product had an image_url, attempt to delete the corresponding image from storage
+        if (productToDelete && productToDelete.image_url) {
             const bucketName = 'product-images';
-            const imagePathInBucket = productToDelete.image_path_in_bucket; // Use the stored path directly
+            const imageUrl = productToDelete.image_url;
 
-            console.log(`Attempting to delete image from storage: ${bucketName}/${imagePathInBucket}`);
-            const { error: storageDeleteError } = await supabase.storage
-                .from(bucketName)
-                .remove([imagePathInBucket]); // Pass the path in an array
+            // Derive the storage path from the public image URL.
+            // The image path in storage (e.g., "public/image.jpg") is what supabase.storage.remove() expects.
+            // Example URL: https://<project>.supabase.co/storage/v1/object/public/<bucket-name>/<path-in-bucket>
+            const storageUrlPart = `/storage/v1/object/public/${bucketName}/`;
+            const pathStartIndex = imageUrl.indexOf(storageUrlPart);
 
-            if (storageDeleteError) {
-                console.warn(`Failed to delete image from storage (product DB record deleted successfully): ${storageDeleteError.message}`);
-                // Don't fail the whole request if image deletion fails, but log it.
+            if (pathStartIndex !== -1) {
+                const imagePathInBucket = imageUrl.substring(pathStartIndex + storageUrlPart.length);
+                console.log(`Attempting to delete image from storage: ${bucketName}/${imagePathInBucket}`);
+                const { error: storageDeleteError } = await supabase.storage
+                    .from(bucketName)
+                    .remove([imagePathInBucket]); // Pass the derived path in an array
+
+                if (storageDeleteError) {
+                    console.warn(`Failed to delete image from storage (product DB record deleted successfully): ${storageDeleteError.message}`);
+                } else {
+                    console.log(`Image ${imagePathInBucket} deleted from storage.`);
+                }
             } else {
-                console.log(`Image ${imagePathInBucket} deleted from storage.`);
+                console.warn(`Could not derive storage path from image_url: ${imageUrl}. Image may not be deleted from storage.`);
             }
         }
-
         res.status(200).json({ message: `Product with ID ${id} deleted successfully.` });
 
     } catch (error) {
